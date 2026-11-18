@@ -1,0 +1,11 @@
+3D dental chart
+
+Tooth models: University of Dundee, School of Dentistry
+https://sketchfab.com/DundeeDental
+Licence: Creative Commons Attribution 4.0 (CC BY 4.0)
+https://creativecommons.org/licenses/by/4.0/
+Used: permanent teeth (upper and lower, all types) and primary teeth
+(upper and lower, all types). Changes: rescaled, simplified, mirrored for the
+right side and arranged into arches by tools/chart3d/build_teeth.py.
+
+three.js (vendor/): MIT licence, see vendor/LICENSE-three.txt.

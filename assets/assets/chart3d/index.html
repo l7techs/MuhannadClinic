@@ -1,0 +1,1064 @@
+<!doctype html>
+<!-- web/chart3d/index.html
+     3D dental chart. Loads teeth_<set>.glb (set: permanent | primary) with a
+     LowerJaw and an UpperJaw node. Each tooth is one smooth mesh named
+     T<FDI> in its own frame (x: mesial -> distal, y: up with the crown tip
+     at 0, z: toward lips/cheek); upper teeth are flipped crown-down by their
+     node. Node extras: crownH, hx, hy (crown half widths), pos (1 = central
+     incisor …), upper, canal0..2 (root canal centre lines).
+
+     Surfaces are worked out per pixel from the local position (smooth
+     borders): M, D, O (occlusal/incisal), B (buccal/labial), L, R (root).
+     Conditions show as raised layers (filling, crown, bridge with a false
+     tooth over a gap, veneer, implant + screw), flat spots (caries,
+     fracture; a ring around a filling = caries at its margin), colour
+     (sealant), canal lines in a see-through root (root canal), a red X
+     (planned extraction) or a faint ghost (missing / extracted). Planned
+     work is see-through.
+
+     Interaction: hover shows "36 · Occlusal". With Apply off, clicking a
+     tooth isolates it and flies the camera to it (‹ › for neighbours,
+     Back or Esc to return). With Apply on, clicking a surface applies the
+     chosen service there (whole-tooth services to the whole tooth), with
+     Undo. Jaws: open/close the mouth, show both / upper / lower.
+
+     Host messages (window.postMessage):
+       in : {type:'conditions', items:[{tooth:36, surface:'O'|null, condition:'filling', planned:false}]}
+            {type:'theme', dark:true}   {type:'lang', lang:'ar'}
+            With ?controls=app the app draws the buttons and sends them:
+            {type:'view', view:'front'|'top'|'left'|'right'}
+            {type:'jaws', jaws:'both'|'upper'|'lower'}
+            {type:'mouth', open:true}   {type:'numbers', show:true}
+            {type:'applyMode', on:true, service:'filling', planned:false}
+       out: {type:'ready'}
+            {type:'select', tooth:36, surface:'O'}               (Apply off)
+            {type:'apply', tooth:36, surface:'O'|null, condition:'filling', planned:false}
+            {type:'undo', item:{…}}                               (undo of the last apply)
+     Query: ?set=permanent|primary&lang=ar&dark=1&demo=1&controls=app.
+     Opened on its own (not inside the app) it keeps the chart itself.
+
+     Tooth models: University of Dundee School of Dentistry, CC BY 4.0. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D dental chart</title>
+<style>
+  :root { --bg:#F8F7FA; --card:#FFFFFF; --text:#444050; --muted:#6D6B77; --border:#E6E6E8; --primary:#7367F0; }
+  :root[data-theme="dark"] { --bg:#25293C; --card:#2F3349; --text:#E1DEF5; --muted:#B0ACC7; --border:#44485E; --primary:#8F85F3; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font:13px "Segoe UI", system-ui, "Noto Sans Arabic", sans-serif; overflow:hidden; }
+  #view { position:absolute; inset:0; }
+  .bar { position:absolute; inset-inline:12px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; pointer-events:none; }
+  .bar > * { pointer-events:auto; }
+  #top { top:12px; }
+  #applyBar { bottom:12px; }
+  button, select { border:1px solid var(--border); background:var(--card); color:var(--text); border-radius:6px; padding:6px 12px; cursor:pointer; font:inherit; }
+  button.on { background:var(--primary); border-color:var(--primary); color:#fff; }
+  button:disabled { opacity:.45; cursor:default; }
+  .group { display:inline-flex; }
+  .group button { border-radius:0; margin-inline-start:-1px; }
+  .group button:first-child { border-start-start-radius:6px; border-end-start-radius:6px; margin:0; }
+  .group button:last-child { border-start-end-radius:6px; border-end-end-radius:6px; }
+  .sep { width:1px; height:24px; background:var(--border); margin:0 2px; }
+  label.chk { display:flex; align-items:center; gap:4px; background:var(--card); border:1px solid var(--border); border-radius:6px; padding:5px 10px; }
+  #labels { position:absolute; inset:0; pointer-events:none; }
+  #labels span { position:absolute; transform:translate(-50%, -50%); font-size:11px; font-weight:600; color:var(--text); background:color-mix(in srgb, var(--card) 82%, transparent); border-radius:8px; padding:1px 5px; white-space:nowrap; transition:opacity .15s; }
+  #tip { position:absolute; pointer-events:none; background:var(--card); border:1px solid var(--border); border-radius:6px; padding:3px 8px; font-size:12px; box-shadow:0 3px 12px rgba(47,43,61,.14); white-space:nowrap; }
+  #panel { position:absolute; top:60px; inset-inline-end:12px; width:230px; background:var(--card); border:1px solid var(--border); border-radius:8px; padding:12px; box-shadow:0 3px 12px rgba(47,43,61,.14); transition:opacity .3s, transform .3s; }
+  #panel[hidden] { display:block; opacity:0; transform:translateY(-6px); pointer-events:none; }
+  #panel h3 { margin:0 0 4px; font-size:16px; }
+  #panel .muted { color:var(--muted); }
+  #panel ul { margin:8px 0; padding-inline-start:18px; }
+  #panel .nav { display:flex; gap:6px; margin-top:8px; }
+  #panel .nav button { flex:1; }
+  #toast[hidden] { display:none; }
+  #toast { position:absolute; bottom:64px; left:50%; transform:translateX(-50%); background:var(--text); color:var(--bg); border-radius:6px; padding:6px 8px 6px 12px; display:flex; gap:10px; align-items:center; transition:opacity .2s; }
+  #toast button { padding:3px 10px; }
+  /* The app draws the buttons in its own card: hide the page's bars. */
+  :root[data-controls="app"] #top, :root[data-controls="app"] #applyBar { display:none; }
+  #status { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--muted); pointer-events:none; }
+  @media (pointer: coarse) {
+    button, select { padding:10px 14px; font-size:14px; }
+  }
+  @media (max-width: 600px) {
+    #panel { top:auto; bottom:64px; inset-inline:12px; width:auto; }
+    .sep { display:none; }
+    .bar { inset-inline:8px; gap:4px; }
+    #top { top:8px; }
+    #applyBar { bottom:8px; }
+    button, select { padding:7px 10px; font-size:12px; }
+    label.chk { padding:5px 8px; font-size:12px; }
+    #panel { bottom:52px; padding:8px 10px; }
+    #panel h3 { display:inline; font-size:14px; }
+    #pSurface { display:inline; margin-inline-start:6px; }
+    #panel ul { margin:4px 0; font-size:12px; }
+    #panel .nav { margin-top:4px; }
+  }
+</style>
+<script type="importmap">{ "imports": { "three": "./vendor/three.module.js" } }</script>
+</head>
+<body>
+<div id="view"></div>
+<div id="labels" hidden></div>
+<div id="tip" hidden></div>
+<div id="status"></div>
+<div id="top" class="bar">
+  <span class="group" id="views">
+    <button data-view="front" class="on"></button>
+    <button data-view="top"></button>
+    <button data-view="left"></button>
+    <button data-view="right"></button>
+  </span>
+  <span class="sep"></span>
+  <span class="group" id="jaws">
+    <button data-jaws="both" class="on"></button>
+    <button data-jaws="upper"></button>
+    <button data-jaws="lower"></button>
+  </span>
+  <button id="mouth"></button>
+  <span class="sep"></span>
+  <button id="numbers"></button>
+</div>
+<div id="applyBar" class="bar">
+  <button id="apply"></button>
+  <select id="service"></select>
+  <label class="chk"><input type="checkbox" id="planned"> <span id="plannedText"></span></label>
+</div>
+<div id="panel" hidden>
+  <h3 id="pTitle"></h3>
+  <div id="pSurface" class="muted"></div>
+  <ul id="pList"></ul>
+  <div class="nav">
+    <button id="prev">‹</button>
+    <button id="back"></button>
+    <button id="next">›</button>
+  </div>
+</div>
+<div id="toast" hidden><span id="toastText"></span><button id="undo"></button></div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from './vendor/GLTFLoader.js';
+import { OrbitControls } from './vendor/OrbitControls.js';
+
+// ------------------------------------------------------------------ words
+const TEXT = {
+  en: {
+    loading: 'Loading…', failed: 'Could not load the 3D model.', front: 'Front', top: 'Biting surface',
+    left: 'Left', right: 'Right', both: 'Both', upper: 'Upper', lower: 'Lower', open: 'Open mouth', close: 'Close mouth',
+    numbers: 'Numbers', apply: 'Apply', planned: 'Planned', tooth: 'Tooth', back: 'Back', noConditions: 'No conditions',
+    applied: (c, t) => `${c} added to ${t}`, undo: 'Undo',
+    s: { M: 'Mesial', D: 'Distal', O: 'Occlusal', I: 'Incisal', B: 'Buccal', La: 'Labial', L: 'Lingual', P: 'Palatal', R: 'Root' },
+    c: { caries: 'Caries', filling: 'Filling', crown: 'Crown', root_canal: 'Root canal', missing: 'Missing', implant: 'Implant',
+      bridge: 'Bridge', extraction: 'Extraction', fracture: 'Fracture', sealant: 'Sealant', veneer: 'Veneer', other: 'Other' },
+  },
+  ar: {
+    loading: 'جارٍ التحميل…', failed: 'تعذّر تحميل النموذج ثلاثي الأبعاد.', front: 'أمامي', top: 'السطح الماضغ',
+    left: 'يسار', right: 'يمين', both: 'الفكّان', upper: 'العلوي', lower: 'السفلي', open: 'فتح الفم', close: 'إغلاق الفم',
+    numbers: 'الأرقام', apply: 'تطبيق', planned: 'مخطط', tooth: 'السن', back: 'رجوع', noConditions: 'لا توجد حالات',
+    applied: (c, t) => `أُضيف ${c} إلى ${t}`, undo: 'تراجع',
+    s: { M: 'أنسي', D: 'وحشي', O: 'إطباقي', I: 'قاطع', B: 'دهليزي', La: 'شفوي', L: 'لساني', P: 'حنكي', R: 'الجذر' },
+    c: { caries: 'نخر', filling: 'حشوة', crown: 'تاج', root_canal: 'معالجة لبية', missing: 'مفقود', implant: 'زرعة',
+      bridge: 'جسر', extraction: 'قلع', fracture: 'كسر', sealant: 'سادّ', veneer: 'قشرة', other: 'أخرى' },
+  },
+};
+const params = new URLSearchParams(location.search);
+// The host app: a web frame (Flutter web), WebView2 (Windows) or a phone
+// web view with a "Chart3D" JavaScript channel. Opened on its own, there is
+// no host and the page keeps the chart itself.
+const host = (() => {
+  if (window.chrome?.webview) return { send: (m) => window.chrome.webview.postMessage(m) };
+  if (window.Chart3D) return { send: (m) => window.Chart3D.postMessage(JSON.stringify(m)) };
+  if (window.parent !== window) return { send: (m) => window.parent.postMessage(m, '*') };
+  return null;
+})();
+const embedded = !!host;
+// Inside the app the page sits on the app's own card: no background.
+if (embedded) for (const el of [document.documentElement, document.body]) el.style.background = 'transparent';
+let lang = params.get('lang') === 'ar' ? 'ar' : 'en';
+let T = TEXT[lang];
+let dark = params.get('dark') === '1' || (!embedded && matchMedia('(prefers-color-scheme: dark)').matches);
+
+// Services offered in Apply mode, in the 2D chart's order. Whole-tooth ones
+// ignore the clicked surface.
+const SERVICES = ['caries', 'filling', 'sealant', 'fracture', 'veneer', 'crown', 'bridge', 'implant', 'root_canal', 'extraction', 'missing'];
+const WHOLE = new Set(['crown', 'bridge', 'implant', 'root_canal', 'extraction', 'missing']);
+
+// ----------------------------------------------------------------- colours
+// [light, dark]; keep in step with ToothConditionType.color in the app.
+// Veneer is the brand's primary purple.
+const COLORS = {
+  caries: ['#6D4C41', '#A1887F'], fracture: ['#E64A19', '#FF8A65'], extraction: ['#8B0000', '#C62828'],
+  filling: ['#1E88E5', '#42A5F5'], sealant: ['#00ACC1', '#26C6DA'], crown: ['#FB8C00', '#FFB74D'],
+  bridge: ['#D81B60', '#F06292'], veneer: ['#7367F0', '#8F85F3'], root_canal: ['#E53935', '#FF5252'],
+  implant: ['#2E7D32', '#66BB6A'], missing: ['#757575', '#9E9E9E'], other: ['#757575', '#9E9E9E'],
+};
+const SURFACES = ['M', 'D', 'O', 'B', 'L', 'R'];
+const colorOf = (name) => new THREE.Color((COLORS[name] ?? COLORS.other)[dark ? 1 : 0]);
+
+// ---------------------------------------------------------------- surfaces
+// One rule for shaders (per pixel) and clicks (per point). p: tooth-local
+// position. Returns 0..5 = M D O B L R.
+const REGION_GLSL = `
+uniform float uCrownH, uHx, uHy, uAnterior;
+int toothRegion(vec3 p) {
+  float depth = -p.y / uCrownH;
+  if (depth > 1.0) return 5;
+  float ex = p.x / uHx, ez = p.z / uHy;
+  if (uAnterior > 0.5) { if (depth < 0.14) return 2; }
+  else if (depth < 0.5 && ex * ex + ez * ez < 0.46) return 2;
+  if (abs(ex) > 0.72) return p.x < 0.0 ? 0 : 1;
+  return p.z > 0.0 ? 3 : 4;
+}`;
+function regionAt(p, t) {
+  const depth = -p.y / t.crownH;
+  if (depth > 1) return 5;
+  const ex = p.x / t.hx, ez = p.z / t.hy;
+  if (t.anterior) { if (depth < 0.14) return 2; }
+  else if (depth < 0.5 && ex * ex + ez * ez < 0.46) return 2;
+  if (Math.abs(ex) > 0.72) return p.x < 0 ? 0 : 1;
+  return p.z > 0 ? 3 : 4;
+}
+
+// Shapes drawn on a tooth as smooth masks. uKind: 1 crown, 2 veneer,
+// 3 spot on surface uSurf (uScale grows/shrinks it, uRing leaves a ring),
+// 4 red X.
+const MASK_GLSL = `
+uniform float uKind, uSurf, uScale, uRing;
+float sq4(float v) { v *= v; return v * v; }
+float spot(vec3 p, float k) {
+  float depth = -p.y / uCrownH;
+  float ex = p.x / uHx, ez = p.z / uHy;
+  int s = int(uSurf + 0.5);
+  if (s == 2) {
+    if (uAnterior > 0.5) return sq4(ex / (0.7 * k)) + sq4(depth / (0.17 * k));
+    if (depth > 0.5) return 9.0;
+    return (ex * ex) / (0.25 * k * k) + (ez * ez) / (0.2 * k * k);
+  }
+  if (s == 3 || s == 4) {
+    if (s == 3 ? p.z < 0.0 : p.z > 0.0) return 9.0;
+    return sq4(ex / (0.5 * k)) + sq4((depth - 0.68) / (0.2 * k));
+  }
+  if ((s == 0 ? p.x > 0.0 : p.x < 0.0) || abs(ex) < 0.74) return 9.0;
+  return sq4(ez / (0.58 * k)) + sq4((depth - 0.45) / (0.24 * k));
+}
+bool inLayer(vec3 p) {
+  float depth = -p.y / uCrownH;
+  float ex = p.x / uHx, ez = p.z / uHy;
+  if (uKind < 1.5) return depth < 0.97;
+  if (uKind < 2.5) return p.z > 0.0 && sq4(ex / 0.82) + sq4((depth - 0.47) / 0.47) < 1.0;
+  if (uKind < 3.5) {
+    if (spot(p, uScale) >= 1.0) return false;
+    return uRing < 0.5 || spot(p, 1.0) >= 1.0;
+  }
+  float w = 0.13;
+  if (p.z > 0.0 && depth > 0.06 && depth < 0.94) {
+    float d = (depth - 0.5) * 1.6;
+    if (abs(ex - d) < w || abs(ex + d) < w) return true;
+  }
+  if (depth < 0.45 && ex * ex + ez * ez < 0.7) return abs(ex - ez) < w * 1.2 || abs(ex + ez) < w * 1.2;
+  return false;
+}`;
+
+function toothUniforms(t) {
+  return { uCrownH: { value: t.crownH }, uHx: { value: t.hx }, uHy: { value: t.hy }, uAnterior: { value: t.anterior ? 1 : 0 } };
+}
+
+const clock = { value: 0 };
+function toothMaterial(t) {
+  const u = {
+    ...toothUniforms(t),
+    uStain: { value: Array.from({ length: 6 }, () => new THREE.Vector4(0, 0, 0, 0)) },
+    uNeck: { value: new THREE.Vector4(0, 0, 0, 0) },
+    uSel: { value: -1 }, uHover: { value: -1 }, uHideRoot: { value: 0 }, uGlassRoot: { value: 0 },
+    uEnamel: { value: new THREE.Color() }, uDentin: { value: new THREE.Color() }, uTime: clock, uFade: { value: 1 },
+  };
+  // Double-sided so clicks also hit the mirrored (right side) teeth, whose
+  // triangles face the other way in local space.
+  const m = new THREE.MeshStandardMaterial({ roughness: 0.36, metalness: 0, side: THREE.DoubleSide });
+  m.onBeforeCompile = (sh) => {
+    Object.assign(sh.uniforms, u);
+    sh.vertexShader = 'varying vec3 vToothPos;\n' + sh.vertexShader
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvToothPos = position;');
+    sh.fragmentShader = `varying vec3 vToothPos;
+      uniform vec4 uStain[6]; uniform vec4 uNeck;
+      uniform float uSel, uHover, uHideRoot, uGlassRoot, uTime, uFade;
+      uniform vec3 uEnamel, uDentin;\n` + REGION_GLSL + '\n' + sh.fragmentShader
+      .replace('#include <color_fragment>', `#include <color_fragment>
+        int r = toothRegion(vToothPos);
+        if (uHideRoot > 0.5 && r == 5) discard;
+        float depth = -vToothPos.y / uCrownH;
+        vec3 base = mix(uEnamel, uDentin, smoothstep(0.92, 1.08, depth));
+        if (uAnterior > 0.5) base = mix(base, base * vec3(0.9, 0.93, 0.98), 0.6 * (1.0 - smoothstep(0.0, 0.16, depth)));
+        diffuseColor.rgb = base;
+        vec4 st = uStain[r];
+        diffuseColor.rgb = mix(diffuseColor.rgb, st.rgb, st.a);
+        diffuseColor.rgb = mix(diffuseColor.rgb, uNeck.rgb, uNeck.a * smoothstep(0.8, 0.86, depth) * (1.0 - smoothstep(1.0, 1.06, depth)));
+        if (r == 5 && uGlassRoot > 0.5) diffuseColor.a = 0.32;
+        diffuseColor.a *= uFade;`)
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+        float pulse = 0.22 + 0.12 * sin(uTime * 4.0);
+        if (float(r) == uSel) totalEmissiveRadiance += vec3(pulse);
+        else if (float(r) == uHover) totalEmissiveRadiance += vec3(0.1);`);
+  };
+  m.userData.u = u;
+  return m;
+}
+
+function layerMaterial(t, opts) {
+  const u = {
+    ...toothUniforms(t), uKind: { value: opts.kind }, uSurf: { value: opts.surf ?? 0 },
+    uScale: { value: opts.scale ?? 1 }, uRing: { value: opts.ring ? 1 : 0 }, uOffset: { value: opts.offset },
+  };
+  const base = opts.planned ? 0.42 : 1;
+  const m = new THREE.MeshStandardMaterial({
+    color: opts.color, roughness: opts.roughness, metalness: opts.metalness ?? 0,
+    transparent: !!opts.planned, opacity: base, depthWrite: !opts.planned,
+  });
+  m.userData.baseOpacity = base;
+  m.onBeforeCompile = (sh) => {
+    Object.assign(sh.uniforms, u);
+    sh.vertexShader = 'varying vec3 vToothPos;\nuniform float uOffset;\n' + sh.vertexShader
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvToothPos = position;\ntransformed += normal * uOffset;');
+    sh.fragmentShader = 'varying vec3 vToothPos;\n' + REGION_GLSL + MASK_GLSL + '\n' + sh.fragmentShader
+      .replace('void main() {', 'void main() {\n  if (!inLayer(vToothPos)) discard;');
+  };
+  return m;
+}
+
+// ------------------------------------------------------------------- scene
+const view = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+view.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 2000);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.enablePan = false;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8794, 1.45));
+const key = new THREE.DirectionalLight(0xffffff, 1.9);
+key.position.set(30, 60, 80);
+camera.add(key);
+const fill = new THREE.DirectionalLight(0xfff4e8, 0.5);
+fill.position.set(-60, -10, 40);
+camera.add(fill);
+scene.add(camera);
+
+/** tooth number → { mesh, crownH, hx, hy, anterior, upper, canals, layers, label, material } */
+const teeth = new Map();
+let lowerJaw = null, upperJaw = null;
+let conditions = [];
+let selected = null;   // { tooth, surface }
+let hovered = null;
+let isolated = null;   // tooth number while a tooth is isolated
+let applyMode = false;
+let showNumbers = false;
+let jawFilter = 'both';
+let mouthOpen = false;
+let box = new THREE.Box3();
+const extras = [];  // bridge connectors
+
+const ghostMat = () => new THREE.MeshStandardMaterial({ color: dark ? 0x76778e : 0xacaab1, transparent: true, opacity: 0.16, depthWrite: false });
+
+function screw(t) {
+  const len = t.crownH * 1.35, pts = [];
+  for (let i = 0; i <= 28; i++) {
+    const y = -t.crownH * 0.9 - (len * i) / 28;
+    const taper = 1 - (0.35 * i) / 28;
+    pts.push(new THREE.Vector2((i % 2 ? 1.55 : 1.9) * taper * Math.min(t.hx, t.hy) / 3.2, y));
+  }
+  pts.push(new THREE.Vector2(0.2, pts.at(-1).y - 0.4));
+  const m = new THREE.MeshStandardMaterial({ color: 0x9aa3ad, roughness: 0.3, metalness: 0.85 });
+  m.userData.baseOpacity = 1;
+  return new THREE.Mesh(new THREE.LatheGeometry(pts.reverse(), 32), m);
+}
+
+function canalLines(t, color, planned) {
+  const group = new THREE.Group();
+  for (const flat of t.canals) {
+    if (flat.length < 6) continue;
+    let pts = [];
+    for (let i = 0; i < flat.length; i += 3) pts.push(new THREE.Vector3(flat[i], flat[i + 1], flat[i + 2]));
+    for (let pass = 0; pass < 4; pass++) {
+      pts = pts.map((p, i) => (i === 0 || i === pts.length - 1 ? p : p.clone().add(pts[i - 1]).add(pts[i + 1]).multiplyScalar(1 / 3)));
+    }
+    pts = pts.filter((_, i) => i % 2 === 0 || i === pts.length - 1);
+    const m = new THREE.MeshStandardMaterial({ color, roughness: 0.4, transparent: planned, opacity: planned ? 0.5 : 1 });
+    m.userData.baseOpacity = planned ? 0.5 : 1;
+    group.add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 40, 0.42, 10), m));
+  }
+  return group;
+}
+
+function addLayer(t, obj) { t.mesh.add(obj); t.layers.push(obj); }
+function addSurfaceLayer(t, opts) {
+  const layer = new THREE.Mesh(t.mesh.geometry, layerMaterial(t, opts));
+  layer.raycast = () => {};
+  addLayer(t, layer);
+}
+
+const LOOK = {
+  filling: { offset: 0.12, roughness: 0.22 },
+  crown: { offset: 0.3, roughness: 0.48, metalness: 0.04 },
+  veneer: { offset: 0.16, roughness: 0.3 },
+  spot: { offset: 0.03, roughness: 0.8 },
+  ring: { offset: 0.14, roughness: 0.8 },
+  cross: { offset: 0.16, roughness: 0.5 },
+};
+
+function repaint() {
+  for (const [, t] of teeth) {
+    for (const l of t.layers) { t.mesh.remove(l); l.traverse((o) => o.material?.dispose?.()); }
+    t.layers = [];
+    t.mesh.material = t.material;
+    const u = t.material.userData.u;
+    u.uStain.value.forEach((v) => v.set(0, 0, 0, 0));
+    u.uNeck.value.set(0, 0, 0, 0);
+    u.uHideRoot.value = 0;
+    u.uGlassRoot.value = 0;
+    u.uEnamel.value.set(dark ? 0xe4ddd0 : 0xf5f0e6);
+    u.uDentin.value.set(dark ? 0xc9b38f : 0xe6d4b2);
+  }
+  for (const e of extras) { e.parent?.remove(e); e.material.dispose(); e.geometry.dispose(); }
+  extras.length = 0;
+
+  const byTooth = new Map();
+  for (const c of conditions) {
+    if (!byTooth.has(c.tooth)) byTooth.set(c.tooth, []);
+    byTooth.get(c.tooth).push(c);
+  }
+  const bridged = [];
+  for (const [n, list] of byTooth) {
+    const t = teeth.get(n);
+    if (!t) continue;
+    const u = t.material.userData.u;
+    const gone = list.some((c) => c.condition === 'missing' || (c.condition === 'extraction' && !c.planned));
+    const bridge = list.find((c) => c.condition === 'bridge');
+    if (bridge) bridged.push({ n, t, planned: !!bridge.planned });
+    if (gone && !bridge) { t.mesh.material = ghostMat(); continue; }
+    if (gone && bridge) u.uHideRoot.value = 1;  // false tooth over the gap
+
+    const fillings = new Set(list.filter((c) => c.condition === 'filling' && !c.planned).map((c) => c.surface ?? 'O'));
+    for (const c of list) {
+      const color = colorOf(c.condition);
+      const planned = !!c.planned;
+      const surf = c.surface ? SURFACES.indexOf(c.surface) : -1;
+      switch (c.condition) {
+        case 'filling':
+          addSurfaceLayer(t, { kind: 3, surf: surf >= 0 && surf < 5 ? surf : 2, color, planned, ...LOOK.filling });
+          break;
+        case 'veneer':
+          addSurfaceLayer(t, { kind: 2, color, planned, ...LOOK.veneer });
+          break;
+        case 'crown': case 'bridge':
+          addSurfaceLayer(t, { kind: 1, color, planned, ...LOOK.crown });
+          break;
+        case 'implant':
+          addSurfaceLayer(t, { kind: 1, color, planned, ...LOOK.crown });
+          u.uHideRoot.value = 1;
+          addLayer(t, screw(t));
+          break;
+        case 'caries': case 'fracture': {
+          if (surf < 0 || surf > 4) { [0, 1, 2, 3, 4].forEach((i) => u.uStain.value[i].set(color.r, color.g, color.b, planned ? 0.4 : 0.85)); break; }
+          const ring = fillings.has(c.surface);
+          addSurfaceLayer(t, ring ? { kind: 3, surf, color, planned, scale: 1.3, ring: true, ...LOOK.ring }
+            : { kind: 3, surf, color, planned, scale: 0.8, ...LOOK.spot });
+          break;
+        }
+        case 'sealant':
+          u.uStain.value[2].set(color.r, color.g, color.b, planned ? 0.4 : 0.8);
+          break;
+        case 'root_canal':
+          u.uNeck.value.set(color.r, color.g, color.b, planned ? 0.4 : 0.9);
+          u.uGlassRoot.value = 1;
+          addLayer(t, canalLines(t, color, planned));
+          break;
+        case 'extraction':  // planned (done extractions are ghosts above)
+          addSurfaceLayer(t, { kind: 4, color, ...LOOK.cross });
+          break;
+        case 'missing':
+          break;
+        default:
+          if (surf >= 0) u.uStain.value[surf].set(color.r, color.g, color.b, 0.7);
+      }
+    }
+  }
+  // Bridge connectors between neighbouring bridge teeth of the same jaw.
+  const neighbours = (a, b) => (Math.floor(a / 10) === Math.floor(b / 10) && Math.abs(a - b) === 1)
+    || (a % 10 === 1 && b % 10 === 1 && Math.abs(a - b) === 10 && teeth.get(a).upper === teeth.get(b).upper);
+  for (let i = 0; i < bridged.length; i++) {
+    for (let j = i + 1; j < bridged.length; j++) {
+      const a = bridged[i], b = bridged[j];
+      if (!neighbours(a.n, b.n)) continue;
+      const jaw = a.t.upper ? upperJaw : lowerJaw;
+      const pa = jaw.worldToLocal(a.t.mesh.localToWorld(new THREE.Vector3(0, -a.t.crownH * 0.5, -a.t.hy * 0.1)));
+      const pb = jaw.worldToLocal(b.t.mesh.localToWorld(new THREE.Vector3(0, -b.t.crownH * 0.5, -b.t.hy * 0.1)));
+      const m = new THREE.MeshStandardMaterial({ color: colorOf('bridge'), roughness: 0.48, transparent: a.planned, opacity: a.planned ? 0.42 : 1 });
+      m.userData.baseOpacity = a.planned ? 0.42 : 1;
+      const bar = new THREE.Mesh(new THREE.CapsuleGeometry(0.9, pa.distanceTo(pb) * 0.5, 4, 12), m);
+      bar.position.copy(pa).lerp(pb, 0.5);
+      bar.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), pb.clone().sub(pa).normalize());
+      bar.userData.teeth = [a.n, b.n];
+      jaw.add(bar);
+      extras.push(bar);
+    }
+  }
+  applyFades(true);
+  highlight();
+}
+
+function highlight() {
+  for (const [n, t] of teeth) {
+    const u = t.material.userData.u;
+    u.uSel.value = selected?.tooth === n ? SURFACES.indexOf(selected.surface) : -1;
+    u.uHover.value = hovered?.tooth === n ? SURFACES.indexOf(hovered.surface) : -1;
+  }
+}
+
+function applyTheme() {
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  repaint();
+}
+
+// --------------------------------------------------- visibility and fades
+// Each tooth has a target visibility (jaw filter, isolation) and a current
+// fade 0..1 that eases toward it, so teeth dissolve rather than pop.
+function wanted(n, t) {
+  if (isolated != null) return n === isolated ? 1 : 0;
+  if (jawFilter === 'upper' && !t.upper) return 0;
+  if (jawFilter === 'lower' && t.upper) return 0;
+  return 1;
+}
+function setFade(t, f) {
+  t.fade = f;
+  t.mesh.visible = f > 0.01;
+  const u = t.material.userData.u;
+  u.uFade.value = f;
+  t.material.transparent = f < 0.999 || u.uGlassRoot.value > 0.5;
+  t.material.depthWrite = f > 0.5;
+  for (const l of t.layers) {
+    l.traverse((o) => {
+      if (!o.material) return;
+      const base = o.material.userData.baseOpacity ?? 1;
+      o.material.opacity = base * f;
+      o.material.transparent = base * f < 0.999;
+    });
+  }
+}
+// Fades take FADE_MS whatever the frame rate.
+const FADE_MS = 400;
+let lastFade = performance.now();
+function applyFades(now = false) {
+  const t1 = performance.now();
+  const stepBy = Math.min(1, (t1 - lastFade) / FADE_MS);
+  lastFade = t1;
+  for (const [n, t] of teeth) {
+    const target = wanted(n, t);
+    if (!now && t.fade === target) continue;
+    const f = now || t.fade == null ? target
+      : target > t.fade ? Math.min(target, t.fade + stepBy) : Math.max(target, t.fade - stepBy);
+    setFade(t, f);
+  }
+  for (const e of extras) {
+    const f = Math.min(...e.userData.teeth.map((n) => teeth.get(n).fade ?? 1));
+    e.visible = f > 0.01;
+    e.material.opacity = (e.material.userData.baseOpacity ?? 1) * f;
+    e.material.transparent = e.material.opacity < 0.999;
+  }
+}
+
+// ----------------------------------------------------------- camera moves
+let flight = null;  // { from: {pos, target}, to: {pos, target}, t0, dur }
+const ease = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+function flyTo(pos, target, dur = 700) {
+  flight = { from: { pos: camera.position.clone(), target: controls.target.clone() }, to: { pos, target }, t0: performance.now(), dur };
+}
+function stepFlight(now) {
+  if (!flight) return;
+  const k = Math.min(1, (now - flight.t0) / flight.dur);
+  const e = ease(k);
+  controls.target.lerpVectors(flight.from.target, flight.to.target, e);
+  // Arc a little: interpolate the distance and the direction separately.
+  const fromDir = flight.from.pos.clone().sub(flight.from.target);
+  const toDir = flight.to.pos.clone().sub(flight.to.target);
+  const len = THREE.MathUtils.lerp(fromDir.length(), toDir.length(), e);
+  const dir = fromDir.normalize().lerp(toDir.normalize(), e).normalize();
+  camera.position.copy(controls.target).add(dir.multiplyScalar(len));
+  if (k >= 1) flight = null;
+}
+
+// Frames the visible teeth from a direction.
+function viewBox() {
+  const b = new THREE.Box3();
+  for (const [n, t] of teeth) {
+    if (!wanted(n, t)) continue;
+    for (const x of [-t.hx, t.hx]) for (const y of [0, -t.crownH - 2]) for (const z of [-t.hy, t.hy]) {
+      b.expandByPoint(t.mesh.localToWorld(new THREE.Vector3(x, y, z)));
+    }
+  }
+  return b.isEmpty() ? box : b;
+}
+function framing(direction, b = viewBox(), tight = 0.74) {
+  const sphere = b.getBoundingSphere(new THREE.Sphere());
+  const fov = THREE.MathUtils.degToRad(camera.fov);
+  const fitH = sphere.radius / Math.sin(fov / 2);
+  const fitW = sphere.radius / Math.sin(Math.atan(Math.tan(fov / 2) * camera.aspect));
+  return { target: sphere.center.clone(), pos: sphere.center.clone().add(direction.clone().normalize().multiplyScalar(Math.max(fitH, fitW) * tight)) };
+}
+let currentView = 'front';
+function viewDir(name) {
+  const below = jawFilter === 'upper';
+  return {
+    front: new THREE.Vector3(0, 0.12, 1),
+    top: below ? new THREE.Vector3(0, -1, 0.15) : new THREE.Vector3(0, 1, 0.15),
+    left: new THREE.Vector3(1, 0.15, 0.2),   // patient's left is +x
+    right: new THREE.Vector3(-1, 0.15, 0.2),
+  }[name];
+}
+function goView(name, animate = true) {
+  currentView = name;
+  document.querySelectorAll('[data-view]').forEach((x) => x.classList.toggle('on', x.dataset.view === name));
+  // A tall, narrow view (a phone) is limited by the arch's width, which the
+  // bounding sphere overstates: come in closer.
+  const portrait = camera.aspect < 1 ? 0.85 : 1;
+  const f = framing(viewDir(name), viewBox(), (name === 'front' ? 0.8 : name === 'top' ? 0.9 : 0.76) * portrait);
+  if (animate) flyTo(f.pos, f.target); else { controls.target.copy(f.target); camera.position.copy(f.pos); controls.update(); }
+}
+
+// ------------------------------------------------------------- isolation
+const ORDER_UPPER = [18, 17, 16, 15, 14, 13, 12, 11, 21, 22, 23, 24, 25, 26, 27, 28, 55, 54, 53, 52, 51, 61, 62, 63, 64, 65];
+const ORDER_LOWER = [48, 47, 46, 45, 44, 43, 42, 41, 31, 32, 33, 34, 35, 36, 37, 38, 85, 84, 83, 82, 81, 71, 72, 73, 74, 75];
+function isolate(n, surface) {
+  const t = teeth.get(n);
+  if (!t) return;
+  isolated = n;
+  selected = { tooth: n, surface: surface ?? (t.anterior ? 'B' : 'O') };
+  aimAtTooth(n);
+  highlight();
+  showPanel();
+  // Isolating only zooms in; the app opens the tooth's findings when the
+  // isolated tooth itself is clicked (pointerup below).
+}
+function aimAtTooth(n, dur = 800) {
+  const t = teeth.get(n);
+  // Look at the crown from its cheek side, a little from the biting side.
+  const centre = t.mesh.localToWorld(new THREE.Vector3(0, -t.crownH * 0.6, 0));
+  const out = t.mesh.localToWorld(new THREE.Vector3(0, -t.crownH * 0.6, 10)).sub(centre).normalize();
+  const bite = t.mesh.localToWorld(new THREE.Vector3(0, 10, 0)).sub(t.mesh.localToWorld(new THREE.Vector3())).normalize();
+  const dir = out.multiplyScalar(1).add(bite.multiplyScalar(0.45)).normalize();
+  const radius = Math.max(t.crownH * 2.2, t.hx * 2) + 6;
+  const dist = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov) / 2) * 0.48;
+  flyTo(centre.clone().add(dir.multiplyScalar(dist)), centre, dur);
+}
+function leaveIsolation() {
+  if (isolated == null) return;
+  isolated = null;
+  selected = null;
+  highlight();
+  showPanel();
+  goView(currentView);
+}
+function step(dir) {
+  if (isolated == null) return;
+  const order = (teeth.get(isolated).upper ? ORDER_UPPER : ORDER_LOWER).filter((n) => teeth.has(n));
+  const i = order.indexOf(isolated);
+  const next = order[(i + dir + order.length) % order.length];
+  isolate(next);
+}
+
+// ------------------------------------------------------------ jaw motion
+// Open: the lower jaw swings down on a hinge behind the molars.
+const HINGE = new THREE.Vector3(0, 30, -85);   // three coords (y up, -z back)
+let jawAngle = 0;
+function setJawAngle(a) {
+  jawAngle = a;
+  if (!lowerJaw) return;
+  // Rotate about the hinge: move to the hinge, rotate, move back.
+  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), a);
+  lowerJaw.quaternion.copy(q);
+  lowerJaw.position.copy(HINGE).sub(HINGE.clone().applyQuaternion(q));
+  lowerJaw.updateMatrixWorld(true);
+}
+// Opening or closing takes about 0.6 s whatever the frame rate.
+const JAW_OPEN = THREE.MathUtils.degToRad(16);
+let lastJaw = performance.now();
+let jawProgress = 0;  // 0 closed … 1 open
+function stepJaw() {
+  const t1 = performance.now();
+  const dt = Math.min(1, (t1 - lastJaw) / 600);
+  lastJaw = t1;
+  const target = mouthOpen ? 1 : 0;
+  if (jawProgress === target) return;
+  jawProgress = target > jawProgress ? Math.min(1, jawProgress + dt) : Math.max(0, jawProgress - dt);
+  setJawAngle(JAW_OPEN * ease(jawProgress));
+}
+
+// ----------------------------------------------------- picking and hover
+const ray = new THREE.Raycaster();
+function pick(e) {
+  const r = renderer.domElement.getBoundingClientRect();
+  ray.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), camera);
+  const targets = [...teeth.values()].filter((t) => t.mesh.visible && t.fade > 0.5).map((t) => t.mesh);
+  const hit = ray.intersectObjects(targets, false)[0];
+  if (!hit) return null;
+  const [n, t] = [...teeth].find(([, x]) => x.mesh === hit.object);
+  return { tooth: n, surface: SURFACES[regionAt(hit.object.worldToLocal(hit.point.clone()), t)] };
+}
+let downAt = null;
+const tip = document.getElementById('tip');
+renderer.domElement.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5) return;
+  const p = pick(e);
+  if (!p) return;
+  if (applyMode) { applyAt(p); return; }
+  if (isolated === p.tooth) {
+    selected = p;
+    highlight();
+    showPanel();
+    if (embedded) host.send({ type: 'select', ...p });
+  } else {
+    isolate(p.tooth, p.surface);
+  }
+});
+renderer.domElement.addEventListener('dblclick', (e) => { if (!pick(e)) leaveIsolation(); });
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') leaveIsolation();
+  if (isolated != null && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) step((e.key === 'ArrowRight') === (lang !== 'ar') ? 1 : -1);
+});
+let hoverQueued = null;
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (e.pointerType === 'touch' || e.buttons) { tip.hidden = true; return; }
+  hoverQueued = e;
+});
+renderer.domElement.addEventListener('pointerleave', () => { hovered = null; tip.hidden = true; highlight(); });
+function updateHover() {
+  if (!hoverQueued || flight) return;
+  const e = hoverQueued;
+  hoverQueued = null;
+  const p = pick(e);
+  const changed = p?.tooth !== hovered?.tooth || p?.surface !== hovered?.surface;
+  hovered = p;
+  renderer.domElement.style.cursor = p ? (applyMode ? 'crosshair' : 'pointer') : 'grab';
+  if (changed) highlight();
+  if (!p) { tip.hidden = true; return; }
+  tip.hidden = false;
+  tip.textContent = `${p.tooth} · ${surfaceLabel(p.tooth, p.surface)}`;
+  tip.style.left = `${e.clientX + 14}px`;
+  tip.style.top = `${e.clientY + 14}px`;
+}
+
+function surfaceLabel(tooth, s) {
+  const t = teeth.get(tooth);
+  if (s === 'O' && t?.anterior) return T.s.I;
+  if (s === 'B' && t?.anterior) return T.s.La;
+  if (s === 'L' && t?.upper) return T.s.P;
+  return T.s[s];
+}
+
+// ------------------------------------------------------------- apply mode
+let lastApplied = null;
+let toastTimer = null;
+function applyAt(p) {
+  const service = document.getElementById('service').value;
+  const planned = document.getElementById('planned').checked;
+  const item = { tooth: p.tooth, surface: WHOLE.has(service) ? null : service === 'veneer' ? 'B' : p.surface, condition: service, planned };
+  if (item.surface === 'R' && !WHOLE.has(service)) return;  // surface services need a crown surface
+  conditions = [...conditions, item];
+  lastApplied = item;
+  repaint();
+  showPanel();
+  if (embedded) host.send({ type: 'apply', ...item });
+  const toast = document.getElementById('toast');
+  document.getElementById('toastText').textContent = T.applied(T.c[service], p.tooth);
+  toast.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toast.hidden = true; }, 5000);
+}
+document.getElementById('undo').addEventListener('click', () => {
+  if (!lastApplied) return;
+  const i = conditions.lastIndexOf(lastApplied);
+  if (i >= 0) conditions = conditions.filter((_, k) => k !== i);
+  if (embedded) host.send({ type: 'undo', item: lastApplied });
+  lastApplied = null;
+  document.getElementById('toast').hidden = true;
+  repaint();
+  showPanel();
+});
+document.getElementById('apply').addEventListener('click', (e) => {
+  applyMode = !applyMode;
+  e.currentTarget.classList.toggle('on', applyMode);
+  document.getElementById('service').disabled = !applyMode;
+});
+
+// ----------------------------------------------------------------- panel
+function showPanel() {
+  const panel = document.getElementById('panel');
+  layoutView();
+  if (isolated == null) { panel.hidden = true; return; }
+  panel.hidden = false;
+  document.getElementById('pTitle').textContent = `${T.tooth} ${isolated}`;
+  document.getElementById('pSurface').textContent = selected?.tooth === isolated ? surfaceLabel(isolated, selected.surface) : '';
+  const here = conditions.filter((c) => c.tooth === isolated);
+  const list = document.getElementById('pList');
+  list.innerHTML = '';
+  if (!here.length) list.innerHTML = `<li class="muted">${T.noConditions}</li>`;
+  for (const c of here) {
+    const li = document.createElement('li');
+    li.innerHTML = `<span style="color:${COLORS[c.condition]?.[dark ? 1 : 0] ?? 'inherit'}">●</span> ${T.c[c.condition] ?? c.condition}`
+      + (c.surface ? ` · ${surfaceLabel(isolated, c.surface)}` : '') + (c.planned ? ` <span class="muted">(${T.planned})</span>` : '');
+    list.appendChild(li);
+  }
+}
+document.getElementById('back').addEventListener('click', leaveIsolation);
+document.getElementById('prev').addEventListener('click', () => step(-1));
+document.getElementById('next').addEventListener('click', () => step(1));
+
+// -------------------------------------------------------------- toolbar
+document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => {
+  if (isolated != null) { isolated = null; selected = null; highlight(); showPanel(); }
+  goView(b.dataset.view);
+}));
+document.querySelectorAll('[data-jaws]').forEach((b) => b.addEventListener('click', () => {
+  jawFilter = b.dataset.jaws;
+  document.querySelectorAll('[data-jaws]').forEach((x) => x.classList.toggle('on', x === b));
+  if (isolated != null) { isolated = null; selected = null; highlight(); showPanel(); }
+  goView(currentView);
+}));
+document.getElementById('mouth').addEventListener('click', () => {
+  mouthOpen = !mouthOpen;
+  applyLang();
+});
+document.getElementById('numbers').addEventListener('click', (e) => {
+  showNumbers = !showNumbers;
+  e.currentTarget.classList.toggle('on', showNumbers);
+  document.getElementById('labels').hidden = !showNumbers;
+});
+
+function applyLang() {
+  T = TEXT[lang];
+  document.documentElement.lang = lang;
+  document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
+  for (const b of document.querySelectorAll('[data-view]')) b.textContent = T[b.dataset.view];
+  for (const b of document.querySelectorAll('[data-jaws]')) b.textContent = T[b.dataset.jaws];
+  document.getElementById('mouth').textContent = mouthOpen ? T.close : T.open;
+  document.getElementById('mouth').classList.toggle('on', mouthOpen);
+  document.getElementById('numbers').textContent = T.numbers;
+  document.getElementById('apply').textContent = T.apply;
+  document.getElementById('plannedText').textContent = T.planned;
+  document.getElementById('back').textContent = T.back;
+  document.getElementById('undo').textContent = T.undo;
+  const sel = document.getElementById('service');
+  const keep = sel.value;
+  sel.innerHTML = SERVICES.map((c) => `<option value="${c}">${T.c[c]}</option>`).join('');
+  sel.value = keep || 'caries';
+  sel.disabled = !applyMode;
+  const st = document.getElementById('status');
+  if (st && !st.dataset.done) st.textContent = T.loading;
+  showPanel();
+}
+
+// --------------------------------------------------------- tooth numbers
+const labelLayer = document.getElementById('labels');
+const occlusionRay = new THREE.Raycaster();
+let labelFrame = 0;
+const tmp = new THREE.Vector3();
+function updateLabels() {
+  if (!showNumbers) return;
+  const w = view.clientWidth, h = view.clientHeight;
+  const check = labelFrame++ % 6 === 0;
+  const blockers = check ? [...teeth.values()].filter((t) => t.mesh.visible).map((t) => t.mesh) : null;
+  for (const [n, t] of teeth) {
+    tmp.set(0, -t.crownH - 0.8, t.hy + 2.4);
+    t.mesh.localToWorld(tmp);
+    if (check) {
+      const dir = tmp.clone().sub(camera.position);
+      const dist = dir.length();
+      occlusionRay.set(camera.position, dir.normalize());
+      occlusionRay.far = dist - 2.0;
+      t.hidden = occlusionRay.intersectObjects(blockers, false).length > 0;
+    }
+    tmp.project(camera);
+    t.label.style.left = `${((tmp.x + 1) / 2) * w}px`;
+    t.label.style.top = `${((1 - tmp.y) / 2) * h}px`;
+    t.label.style.opacity = !t.mesh.visible || t.fade < 0.5 || (t.hidden && selected?.tooth !== n) ? 0 : 1;
+  }
+}
+
+// ------------------------------------------------------------- messages
+function receive(d) {
+  if (typeof d === 'string') { try { d = JSON.parse(d); } catch { return; } }
+  if (d?.type === 'conditions') { conditions = d.items ?? []; repaint(); showPanel(); }
+  if (d?.type === 'theme') { dark = !!d.dark; applyTheme(); showPanel(); }
+  if (d?.type === 'lang') { lang = d.lang === 'ar' ? 'ar' : 'en'; applyLang(); }
+  // The app's buttons (?controls=app).
+  if (d?.type === 'view' && viewDir(d.view)) { leaveIsolationQuietly(); goView(d.view); }
+  if (d?.type === 'jaws' && ['both', 'upper', 'lower'].includes(d.jaws)) {
+    jawFilter = d.jaws;
+    document.querySelectorAll('[data-jaws]').forEach((x) => x.classList.toggle('on', x.dataset.jaws === jawFilter));
+    leaveIsolationQuietly();
+    goView(currentView);
+  }
+  if (d?.type === 'mouth') { mouthOpen = !!d.open; applyLang(); }
+  if (d?.type === 'numbers') {
+    showNumbers = !!d.show;
+    document.getElementById('numbers').classList.toggle('on', showNumbers);
+    document.getElementById('labels').hidden = !showNumbers;
+  }
+  if (d?.type === 'applyMode') {
+    applyMode = !!d.on;
+    document.getElementById('apply').classList.toggle('on', applyMode);
+    const sel = document.getElementById('service');
+    if (SERVICES.includes(d.service)) sel.value = d.service;
+    sel.disabled = !applyMode;
+    document.getElementById('planned').checked = !!d.planned;
+  }
+}
+/** Back to the whole mouth without flying the camera (a view change follows). */
+function leaveIsolationQuietly() {
+  if (isolated == null) return;
+  isolated = null;
+  selected = null;
+  highlight();
+  showPanel();
+}
+window.addEventListener('message', (e) => receive(e.data));            // web frame
+window.chrome?.webview?.addEventListener('message', (e) => receive(e.data));  // WebView2
+window.__chart3dIn = receive;                                            // phone web view
+
+// The teeth get the space between the toolbar and the Apply bar, so neither
+// covers them (on a phone the toolbar takes two rows).
+const topBar = document.getElementById('top');
+const applyBar = document.getElementById('applyBar');
+const panelEl = document.getElementById('panel');
+const narrow = matchMedia('(max-width: 600px)');
+function layoutView() {
+  // On a phone the tooth panel spans the width at the bottom; an isolated
+  // tooth is framed in the space above it. With the app's buttons there are
+  // no bars, so the teeth get the whole frame.
+  const appControls = document.documentElement.dataset.controls === 'app';
+  const fullBottom = view.parentElement.clientHeight;
+  const bottomEdge = narrow.matches && isolated != null ? panelEl.offsetTop : appControls ? fullBottom : applyBar.offsetTop;
+  view.style.top = appControls ? '0px' : `${topBar.offsetTop + topBar.offsetHeight + 4}px`;
+  view.style.bottom = `${Math.max(0, fullBottom - bottomEdge + (appControls && bottomEdge === fullBottom ? 0 : 4))}px`;
+  labelLayer.style.top = view.style.top;      // tooth numbers sit over the view
+  labelLayer.style.bottom = view.style.bottom;
+}
+new ResizeObserver(layoutView).observe(topBar);
+new ResizeObserver(layoutView).observe(applyBar);
+new ResizeObserver(layoutView).observe(document.body);
+new ResizeObserver(layoutView).observe(panelEl);
+layoutView();
+
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  if (!w || !h) return;
+  renderer.setSize(w, h, false);
+  renderer.domElement.style.width = w + 'px';
+  renderer.domElement.style.height = h + 'px';
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  // Refit to the new shape: the whole mouth at once, an isolated tooth by
+  // finishing its flight (or a short one) to the new framing.
+  if (!teeth.size) return;
+  if (isolated == null) goView(currentView, false);
+  else aimAtTooth(isolated, flight ? Math.max(300, flight.dur - (performance.now() - flight.t0)) : 300);
+}
+new ResizeObserver(resize).observe(view);
+
+// ?demo=1: a sample chart showing every kind of condition.
+const DEMO = [
+  { tooth: 42, surface: 'B', condition: 'caries' },
+  { tooth: 31, surface: 'B', condition: 'filling' },
+  { tooth: 32, surface: 'B', condition: 'filling' }, { tooth: 32, surface: 'B', condition: 'caries' },
+  { tooth: 36, surface: 'O', condition: 'filling' }, { tooth: 36, surface: 'M', condition: 'caries' },
+  { tooth: 45, condition: 'bridge' }, { tooth: 46, condition: 'bridge' }, { tooth: 46, condition: 'missing' }, { tooth: 47, condition: 'bridge' },
+  { tooth: 35, condition: 'root_canal' }, { tooth: 35, surface: 'O', condition: 'filling' },
+  { tooth: 37, condition: 'missing' },
+  { tooth: 33, surface: 'B', condition: 'caries', planned: true },
+  { tooth: 44, condition: 'sealant' },
+  { tooth: 11, surface: 'B', condition: 'veneer' }, { tooth: 21, surface: 'B', condition: 'veneer' },
+  { tooth: 38, condition: 'implant' },
+  { tooth: 48, condition: 'extraction', planned: true },
+  { tooth: 26, condition: 'crown' }, { tooth: 16, surface: 'O', condition: 'filling' },
+  { tooth: 14, condition: 'root_canal' }, { tooth: 24, surface: 'D', condition: 'caries' },
+  { tooth: 18, condition: 'missing' },
+];
+
+// Start in the app's theme and language (passed in the address), so the
+// page never shows light / English first.
+document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+if (params.get('controls') === 'app') document.documentElement.dataset.controls = 'app';
+applyLang();
+layoutView();
+
+// A lost graphics context (e.g. too many 3D views opened over time) would
+// leave a blank view: start the page again instead.
+let leaving = false;
+renderer.domElement.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault();
+  if (!leaving) setTimeout(() => location.reload(), 300);
+});
+// Free the graphics context as soon as the page goes away.
+window.addEventListener('pagehide', () => {
+  leaving = true;
+  renderer.dispose();
+  renderer.forceContextLoss();
+});
+
+const set = params.get('set') === 'primary' ? 'primary' : 'permanent';
+new GLTFLoader().load(`./teeth_${set}.glb`, (gltf) => {
+  scene.add(gltf.scene);
+  lowerJaw = gltf.scene.getObjectByName('LowerJaw');
+  upperJaw = gltf.scene.getObjectByName('UpperJaw');
+  gltf.scene.traverse((o) => {
+    if (!o.isMesh) return;
+    const m = o.name.match(/^T(\d\d)$/);
+    const x = o.userData;
+    if (!m || !x.crownH) return;
+    const t = {
+      mesh: o, crownH: x.crownH, hx: x.hx, hy: x.hy, pos: x.pos, anterior: x.pos <= 3, upper: x.upper === 1,
+      layers: [], canals: [x.canal0, x.canal1, x.canal2].filter(Boolean),
+    };
+    t.material = toothMaterial(t);
+    t.label = document.createElement('span');
+    t.label.textContent = m[1];
+    labelLayer.appendChild(t.label);
+    teeth.set(+m[1], t);
+  });
+  gltf.scene.updateMatrixWorld(true);
+  box = viewBox();
+  const st = document.getElementById('status');
+  st.dataset.done = '1';
+  st.textContent = '';
+  try {
+    resize();
+    if (params.get('demo') === '1' && set === 'permanent') conditions = DEMO;
+    applyTheme();
+    goView('front', false);
+  } catch (err) {
+    console.error(err);
+  } finally {
+    // Always tell the app, so it sends the chart and stops waiting.
+    if (embedded) host.send({ type: 'ready' });
+  }
+}, undefined, (err) => { document.getElementById('status').textContent = T.failed; console.error(err); });
+
+const timer = new THREE.Timer();
+renderer.setAnimationLoop((time) => {
+  timer.update(time);
+  clock.value = timer.getElapsed();
+  stepFlight(performance.now());
+  stepJaw();
+  applyFades();
+  controls.update();
+  updateHover();
+  renderer.render(scene, camera);
+  updateLabels();
+});
+
+// For debugging from the browser console.
+window.chart3d = { teeth, scene, renderer, camera, controls, isolate, leaveIsolation, get conditions() { return conditions; } };
+</script>
+</body>
+</html>
